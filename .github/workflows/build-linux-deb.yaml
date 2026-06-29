@@ -1,0 +1,149 @@
+# Standalone workflow — build ORGII Linux x64 .deb only.
+#
+# Uploads the .deb to GitHub Release and as a workflow artifact.
+#
+# Triggers:
+#   - workflow_dispatch  (manual; optional release_tag input)
+#   - push tag v*          (creates/updates Release for that tag)
+#
+# Optional secrets (same as release.yaml; build succeeds without them):
+#   ORGII_DIAGNOSTICS_TOKEN
+#   TAURI_SIGNING_PRIVATE_KEY
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+
+name: "Build Linux deb"
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "GitHub Release tag to upload .deb to (e.g. v1.1.7). Leave empty to skip Release upload."
+        required: false
+        type: string
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-deb:
+    name: Build Linux x64 (.deb)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          FULL_VERSION="${GITHUB_REF_NAME#v}"
+          if ! [[ "$FULL_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must be valid three-part SemVer: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          SEMVER="$FULL_VERSION"
+          echo "SEMVER=$SEMVER" >> "$GITHUB_ENV"
+          sed -i "s/\"version\": \".*\"/\"version\": \"$SEMVER\"/" src-tauri/tauri.conf.json
+          sed -i "s/\"version\": \".*\"/\"version\": \"$FULL_VERSION\"/" package.json
+          grep '"version"' src-tauri/tauri.conf.json package.json
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: "pnpm"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          shared-key: "build-linux-deb-x64"
+
+      - name: Build ORGII (.deb only)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          ORGII_DIAGNOSTICS_TOKEN: ${{ secrets.ORGII_DIAGNOSTICS_TOKEN }}
+          ORGII_APP_VERSION: ${{ env.SEMVER }}
+        run: pnpm tauri build --target x86_64-unknown-linux-gnu --bundles deb
+
+      - name: Gather .deb artifact
+        id: artifacts
+        run: |
+          BUNDLE_DIR="src-tauri/target/x86_64-unknown-linux-gnu/release/bundle"
+          DEB=$(find "$BUNDLE_DIR/deb" -name "*.deb" | head -1)
+
+          if [ ! -f "$DEB" ]; then
+            echo "Missing .deb artifact under $BUNDLE_DIR/deb" >&2
+            exit 1
+          fi
+
+          LATEST_DEB="ORG2-latest-linux-x64.deb"
+          cp "$DEB" "$LATEST_DEB"
+
+          echo "deb=$DEB" >> "$GITHUB_OUTPUT"
+          echo "latest_deb=$LATEST_DEB" >> "$GITHUB_OUTPUT"
+          echo "deb_name=$(basename "$DEB")" >> "$GITHUB_OUTPUT"
+
+          echo "=== Linux deb artifact ==="
+          ls -lh "$DEB" "$LATEST_DEB"
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: org2-linux-x64-deb
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            ${{ steps.artifacts.outputs.deb }}
+            ${{ steps.artifacts.outputs.latest_deb }}
+
+      - name: Upload .deb to GitHub Release (tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          generate_release_notes: true
+          overwrite_files: true
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-nightly') }}
+          files: |
+            ${{ steps.artifacts.outputs.deb }}
+            ${{ steps.artifacts.outputs.latest_deb }}
+
+      - name: Upload .deb to GitHub Release (manual)
+        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          draft: false
+          overwrite_files: true
+          prerelease: ${{ contains(inputs.release_tag, '-rc') || contains(inputs.release_tag, '-beta') || contains(inputs.release_tag, '-alpha') || contains(inputs.release_tag, '-nightly') }}
+          files: |
+            ${{ steps.artifacts.outputs.deb }}
+            ${{ steps.artifacts.outputs.latest_deb }}
