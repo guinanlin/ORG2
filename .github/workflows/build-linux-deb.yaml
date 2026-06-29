@@ -3,13 +3,19 @@
 # Uploads the .deb to GitHub Release and as a workflow artifact.
 #
 # Triggers:
-#   - workflow_dispatch  (manual; optional release_tag input)
+#   - workflow_dispatch  (manual; optional release_tag — auto-generates if empty)
 #   - push tag v*          (creates/updates Release for that tag)
 #
-# Optional secrets (same as release.yaml; build succeeds without them):
+# Version resolution:
+#   - tag push     → version from git tag (e.g. v1.1.7 → 1.1.7)
+#   - manual + tag → version from release_tag input
+#   - manual, no tag → auto: {package.json}-dev.{run}.{sha} + Release v…
+#
+# Optional secrets:
 #   ORGII_DIAGNOSTICS_TOKEN
-#   TAURI_SIGNING_PRIVATE_KEY
-#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#
+# This workflow does NOT sign updater artifacts (deb-only). Updater signing
+# lives in release.yaml — do not pass TAURI_SIGNING_* here.
 
 name: "Build Linux deb"
 
@@ -17,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "GitHub Release tag to upload .deb to (e.g. v1.1.7). Leave empty to skip Release upload."
+        description: "Release tag (e.g. v1.1.7). Leave empty to auto-generate v{package.json}-dev.{run}.{sha}."
         required: false
         type: string
   push:
@@ -37,18 +43,48 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set version from tag
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Resolve build version
+        id: version
         run: |
-          FULL_VERSION="${GITHUB_REF_NAME#v}"
-          if ! [[ "$FULL_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Release tag must be valid three-part SemVer: $GITHUB_REF_NAME" >&2
+          semver_re='^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'
+
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            RELEASE_TAG="${{ github.ref_name }}"
+            FULL_VERSION="${RELEASE_TAG#v}"
+            VERSION_SOURCE="git-tag"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.release_tag }}" ]]; then
+            RELEASE_TAG="${{ inputs.release_tag }}"
+            if [[ ! "$RELEASE_TAG" =~ ^v ]]; then
+              RELEASE_TAG="v${RELEASE_TAG}"
+            fi
+            FULL_VERSION="${RELEASE_TAG#v}"
+            VERSION_SOURCE="manual-input"
+          else
+            BASE_VERSION=$(node -p "require('./package.json').version.replace(/[-+].*$/, '')")
+            SHORT_SHA="${GITHUB_SHA:0:7}"
+            FULL_VERSION="${BASE_VERSION}-dev.${GITHUB_RUN_NUMBER}.${SHORT_SHA}"
+            RELEASE_TAG="v${FULL_VERSION}"
+            VERSION_SOURCE="auto"
+          fi
+
+          if ! [[ "$FULL_VERSION" =~ $semver_re ]]; then
+            echo "Invalid version '$FULL_VERSION' (source: $VERSION_SOURCE)" >&2
             exit 1
           fi
-          SEMVER="$FULL_VERSION"
-          echo "SEMVER=$SEMVER" >> "$GITHUB_ENV"
-          sed -i "s/\"version\": \".*\"/\"version\": \"$SEMVER\"/" src-tauri/tauri.conf.json
+
+          echo "FULL_VERSION=$FULL_VERSION" >> "$GITHUB_ENV"
+          echo "SEMVER=$FULL_VERSION" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "VERSION_SOURCE=$VERSION_SOURCE" >> "$GITHUB_ENV"
+          echo "source=$VERSION_SOURCE" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+          sed -i "s/\"version\": \".*\"/\"version\": \"$FULL_VERSION\"/" src-tauri/tauri.conf.json
           sed -i "s/\"version\": \".*\"/\"version\": \"$FULL_VERSION\"/" package.json
+
+          echo "=== Resolved version (source: $VERSION_SOURCE) ==="
+          echo "  Release tag: $RELEASE_TAG"
+          echo "  App version: $FULL_VERSION"
           grep '"version"' src-tauri/tauri.conf.json package.json
 
       - name: Install Linux build dependencies
@@ -86,11 +122,13 @@ jobs:
 
       - name: Build ORGII (.deb only)
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           ORGII_DIAGNOSTICS_TOKEN: ${{ secrets.ORGII_DIAGNOSTICS_TOKEN }}
           ORGII_APP_VERSION: ${{ env.SEMVER }}
-        run: pnpm tauri build --target x86_64-unknown-linux-gnu --bundles deb
+        run: |
+          pnpm tauri build \
+            --target x86_64-unknown-linux-gnu \
+            --bundles deb \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Gather .deb artifact
         id: artifacts
@@ -123,27 +161,16 @@ jobs:
             ${{ steps.artifacts.outputs.deb }}
             ${{ steps.artifacts.outputs.latest_deb }}
 
-      - name: Upload .deb to GitHub Release (tag push)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Upload .deb to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
           draft: false
-          generate_release_notes: true
+          generate_release_notes: ${{ steps.version.outputs.source == 'git-tag' }}
           overwrite_files: true
-          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-nightly') }}
-          files: |
-            ${{ steps.artifacts.outputs.deb }}
-            ${{ steps.artifacts.outputs.latest_deb }}
-
-      - name: Upload .deb to GitHub Release (manual)
-        if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ inputs.release_tag }}
-          draft: false
-          overwrite_files: true
-          prerelease: ${{ contains(inputs.release_tag, '-rc') || contains(inputs.release_tag, '-beta') || contains(inputs.release_tag, '-alpha') || contains(inputs.release_tag, '-nightly') }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-dev.') || contains(env.RELEASE_TAG, '-rc') || contains(env.RELEASE_TAG, '-beta') || contains(env.RELEASE_TAG, '-alpha') || contains(env.RELEASE_TAG, '-nightly') }}
           files: |
             ${{ steps.artifacts.outputs.deb }}
             ${{ steps.artifacts.outputs.latest_deb }}
